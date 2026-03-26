@@ -10,8 +10,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/ks1686/genv/internal/adapter"
 	"github.com/ks1686/genv/internal/commands"
@@ -48,6 +50,14 @@ var (
 	commit  = "none"
 	date    = "unknown"
 )
+
+var safeEditors = map[string]bool{
+	"vi":    true,
+	"vim":   true,
+	"nano":  true,
+	"emacs": true,
+	"code":  true,
+}
 
 func main() {
 	os.Exit(run(os.Args[1:]))
@@ -379,11 +389,15 @@ func removeCmd(args []string) int {
 	}
 	id := fs.Arg(0)
 
+	return runRemove(*file, id)
+}
+
+func runRemove(file, id string) int {
 	// 0. When stdin is a terminal and id has no exact match in the spec,
 	//    fall back to substring matching so users can type short names
 	//    (e.g. "firefox" resolving to a tracked id like "org.mozilla.firefox").
 	if isTerminal() {
-		if f, err := genvfile.Read(*file); err == nil {
+		if f, err := genvfile.Read(file); err == nil {
 			idLower := strings.ToLower(id)
 			exact := false
 			var matches []string
@@ -417,7 +431,7 @@ func removeCmd(args []string) int {
 	}
 
 	// 1. Update genv.json and read lock.
-	lf, lockPath, exit := removeFromSpecAndReadLock(*file, id)
+	lf, lockPath, exit := removeFromSpecAndReadLock(file, id)
 	if exit != exitOK {
 		return exit
 	}
@@ -650,6 +664,17 @@ func listCmd(args []string) int {
 // applyCmd implements `genv apply [--dry-run] [--strict] [--yes] [--json] [--timeout] [--debug]`.
 // Reconciles the system against genv.json by installing added packages and
 // removing packages that were deleted from the spec since the last apply.
+type applyOptions struct {
+	File    string
+	DryRun  bool
+	Strict  bool
+	Yes     bool
+	Quiet   bool
+	JSONOut bool
+	Timeout time.Duration
+	Debug   bool
+}
+
 func applyCmd(args []string) int {
 	fs := flag.NewFlagSet("apply", flag.ContinueOnError)
 	fs.Usage = func() {
@@ -659,33 +684,39 @@ func applyCmd(args []string) int {
 		fs.PrintDefaults()
 	}
 
-	file := fs.String("file", defaultSpecPath(), "path to genv.json")
-	dryRun := fs.Bool("dry-run", false, "print the reconcile plan without executing")
-	strict := fs.Bool("strict", false, "exit with an error if any package cannot be resolved")
-	yes := fs.Bool("yes", false, "skip the confirmation prompt (for CI and scripts)")
-	quiet := fs.Bool("quiet", false, "suppress plan output (useful in scripts)")
-	jsonOut := fs.Bool("json", false, "emit machine-readable JSON to stdout instead of human-readable text")
-	timeout := fs.Duration("timeout", 0, "per-subprocess timeout, e.g. 5m or 30s (0 means no timeout)")
-	debug := fs.Bool("debug", false, "emit debug-level structured logs to stderr")
+	opts := applyOptions{}
+	fs.StringVar(&opts.File, "file", defaultSpecPath(), "path to genv.json")
+	fs.BoolVar(&opts.DryRun, "dry-run", false, "print the reconcile plan without executing")
+	fs.BoolVar(&opts.Strict, "strict", false, "exit with an error if any package cannot be resolved")
+	fs.BoolVar(&opts.Yes, "yes", false, "skip the confirmation prompt (for CI and scripts)")
+	fs.BoolVar(&opts.Quiet, "quiet", false, "suppress plan output (useful in scripts)")
+	fs.BoolVar(&opts.JSONOut, "json", false, "emit machine-readable JSON to stdout instead of human-readable text")
+	fs.DurationVar(&opts.Timeout, "timeout", 0, "per-subprocess timeout, e.g. 5m or 30s (0 means no timeout)")
+	fs.BoolVar(&opts.Debug, "debug", false, "emit debug-level structured logs to stderr")
 
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
-	if *debug {
+
+	return runApply(opts)
+}
+
+func runApply(opts applyOptions) int {
+	if opts.Debug {
 		logging.Init(true)
 	}
 
 	ctx := context.Background()
-	if *timeout > 0 {
+	if opts.Timeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, *timeout)
+		ctx, cancel = context.WithTimeout(ctx, opts.Timeout)
 		defer cancel()
 	}
 
-	f, err := genvfile.Read(*file)
+	f, err := genvfile.Read(opts.File)
 	if err != nil {
 		if errors.Is(err, genvfile.ErrNotFound) {
-			fprintf(os.Stderr, "genv: %s not found — run 'genv add' to create it\n", *file)
+			fprintf(os.Stderr, "genv: %s not found — run 'genv add' to create it\n", opts.File)
 			return exitIO
 		}
 		fprintf(os.Stderr, "genv: %v\n", err)
@@ -698,7 +729,7 @@ func applyCmd(args []string) int {
 		return exitIO
 	}
 
-	lockPath := genvfile.LockPathFrom(*file)
+	lockPath := genvfile.LockPathFrom(opts.File)
 	lf, err := genvfile.ReadLock(lockPath)
 	if err != nil {
 		fprintf(os.Stderr, "genv: reading lock: %v\n", err)
@@ -708,51 +739,58 @@ func applyCmd(args []string) int {
 	available := resolver.Detect()
 	result := resolver.Reconcile(f.Packages, lf.Packages, available)
 
-	if *jsonOut {
-		// Build plan data directly from the reconcile result.
-		planData := buildPlanResult(result)
-		if *dryRun {
-			return writeJSON(os.Stdout, output.Envelope{
-				Version: output.SchemaVersion,
-				Command: "apply",
-				OK:      true,
-				Data:    planData,
-			})
-		}
-		// Execute with subprocess output routed to stderr so stdout stays clean.
-		execResult := resolver.ExecuteApply(ctx, result, os.Stdin, os.Stderr, os.Stderr)
-		errs := errStrings(execResult.Errors)
-		// Apply env and shell (update lf in memory), then write lock once.
-		envApplied, envRemoved := applyEnvVars(f, lf, false)
-		shellApplied, shellRemoved := applyShellCfg(f, lf, false)
-		writeLockAfterApply(lockPath, lf, result, execResult)
-		installed := make([]string, len(execResult.Installed))
-		for i, lp := range execResult.Installed {
-			installed[i] = lp.ID
-		}
+	if opts.JSONOut {
+		return runApplyJSON(ctx, opts, lockPath, f, lf, result)
+	}
+	return runApplyText(ctx, opts, lockPath, f, lf, result)
+}
+
+func runApplyJSON(ctx context.Context, opts applyOptions, lockPath string, f *schema.GenvFile, lf *genvfile.LockFile, result resolver.ReconcileResult) int {
+	planData := buildPlanResult(result)
+	if opts.DryRun {
 		return writeJSON(os.Stdout, output.Envelope{
 			Version: output.SchemaVersion,
 			Command: "apply",
-			OK:      len(errs) == 0,
-			Data: output.ApplyResult{
-				Installed:    installed,
-				Uninstalled:  execResult.Uninstalled,
-				EnvApplied:   envApplied,
-				EnvRemoved:   envRemoved,
-				ShellApplied: shellApplied,
-				ShellRemoved: shellRemoved,
-			},
-			Errors: errs,
+			OK:      true,
+			Data:    planData,
 		})
 	}
 
+	execResult := resolver.ExecuteApply(ctx, result, os.Stdin, os.Stderr, os.Stderr)
+	errs := errStrings(execResult.Errors)
+
+	envApplied, envRemoved := applyEnvVars(f, lf, false)
+	shellApplied, shellRemoved := applyShellCfg(f, lf, false)
+	writeLockAfterApply(lockPath, lf, result, execResult)
+
+	installed := make([]string, len(execResult.Installed))
+	for i, lp := range execResult.Installed {
+		installed[i] = lp.ID
+	}
+
+	return writeJSON(os.Stdout, output.Envelope{
+		Version: output.SchemaVersion,
+		Command: "apply",
+		OK:      len(errs) == 0,
+		Data: output.ApplyResult{
+			Installed:    installed,
+			Uninstalled:  execResult.Uninstalled,
+			EnvApplied:   envApplied,
+			EnvRemoved:   envRemoved,
+			ShellApplied: shellApplied,
+			ShellRemoved: shellRemoved,
+		},
+		Errors: errs,
+	})
+}
+
+func runApplyText(ctx context.Context, opts applyOptions, lockPath string, f *schema.GenvFile, lf *genvfile.LockFile, result resolver.ReconcileResult) int {
 	planOut := io.Writer(os.Stdout)
-	if *quiet {
+	if opts.Quiet {
 		planOut = io.Discard
 	}
 	toInstall, toRemove, unresolvedCount := resolver.PrintReconcilePlan(result, planOut)
 
-	// Count env and shell changes needed (entries that are missing, modified, or extra).
 	var envChanges int
 	for _, e := range genvenv.EnvStatus(f.Env, lf.Env) {
 		if e.Kind != genvenv.EnvStatusOK {
@@ -767,22 +805,22 @@ func applyCmd(args []string) int {
 	}
 
 	if toInstall == 0 && toRemove == 0 && envChanges == 0 && shellChanges == 0 {
-		if !*quiet {
+		if !opts.Quiet {
 			fPrintln(os.Stdout, "already up to date.")
 		}
 		return exitOK
 	}
 
-	if unresolvedCount > 0 && *strict {
+	if unresolvedCount > 0 && opts.Strict {
 		fprintf(os.Stderr, "genv apply: %d package(s) unresolved; aborting (--strict)\n", unresolvedCount)
 		return exitLogic
 	}
 
-	if *dryRun {
-		if envChanges > 0 && !*quiet {
+	if opts.DryRun {
+		if envChanges > 0 && !opts.Quiet {
 			fprintf(os.Stdout, "env: %d variable(s) to apply\n", envChanges)
 		}
-		if shellChanges > 0 && !*quiet {
+		if shellChanges > 0 && !opts.Quiet {
 			fprintf(os.Stdout, "shell: %d config entries to apply\n", shellChanges)
 		}
 		return exitOK
@@ -796,15 +834,16 @@ func applyCmd(args []string) int {
 		confirmMsg += fmt.Sprintf(", apply %d shell config entry/entries", shellChanges)
 	}
 	confirmMsg += ". Continue? [y/N] "
-	if !*yes && !confirm(confirmMsg) {
+
+	if !opts.Yes && !confirm(confirmMsg) {
 		fPrintln(os.Stdout, "Aborted.")
 		return exitOK
 	}
 
 	execResult := resolver.ExecuteApply(ctx, result, os.Stdin, os.Stdout, os.Stderr)
-	// Apply env and shell (update lf in memory), then write lock once.
-	applyEnvVars(f, lf, !*quiet)
-	applyShellCfg(f, lf, !*quiet)
+
+	applyEnvVars(f, lf, !opts.Quiet)
+	applyShellCfg(f, lf, !opts.Quiet)
 	writeLockAfterApply(lockPath, lf, result, execResult)
 
 	if len(execResult.Errors) > 0 {
@@ -1435,12 +1474,17 @@ func shellEditCmd(args []string) int {
 		editor = "vi"
 	}
 
-	cmd := exec.Command(editor, *file)
+	cmd, err := buildEditorCmd(editor, *file)
+	if err != nil {
+		fprintf(os.Stderr, "genv shell edit: %v\n", err)
+		return exitLogic
+	}
+
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		fprintf(os.Stderr, "genv: editor exited with error: %v\n", err)
+		fprintf(os.Stderr, "genv shell edit: editor exited with error: %v\n", err)
 		return exitLogic
 	}
 	return exitOK
@@ -1906,6 +1950,24 @@ func cleanCmd(args []string) int {
 	return exitCode
 }
 
+// buildEditorCmd parses the editor string, validates the executable against a
+// whitelist of safe editors, and returns an exec.Cmd ready to run.
+func buildEditorCmd(editor, file string) (*exec.Cmd, error) {
+	fields := strings.Fields(editor)
+	if len(fields) == 0 {
+		return exec.Command("vi", file), nil
+	}
+
+	bin := fields[0]
+	base := filepath.Base(bin)
+	if !safeEditors[base] {
+		return nil, fmt.Errorf("editor %q is not allowed; must be one of: vi, vim, nano, emacs, code", bin)
+	}
+
+	args := append(fields[1:], file)
+	return exec.Command(bin, args...), nil
+}
+
 // editCmd implements `genv edit`.
 // Opens genv.json in the user's preferred editor ($VISUAL, $EDITOR, or vi).
 func editCmd(args []string) int {
@@ -1923,7 +1985,12 @@ func editCmd(args []string) int {
 		editor = "vi"
 	}
 
-	cmd := exec.Command(editor, *file)
+	cmd, err := buildEditorCmd(editor, *file)
+	if err != nil {
+		fprintf(os.Stderr, "genv edit: %v\n", err)
+		return exitLogic
+	}
+
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -2068,20 +2135,9 @@ func upgradeCmd(args []string) int {
 		return exitOK
 	}
 
-	// Build upgrade plan, storing each adapter to avoid repeated ByName lookups.
-	type upgradeAction struct {
-		lp  genvfile.LockedPackage
-		mgr adapter.Adapter
-		cmd []string
-	}
-	var plan []upgradeAction
-	for _, lp := range lf.Packages {
-		mgr := adapter.ByName(lp.Manager)
-		if mgr == nil {
-			fprintf(os.Stderr, "genv upgrade: adapter %q not registered for %s — skipping\n", lp.Manager, lp.ID)
-			continue
-		}
-		plan = append(plan, upgradeAction{lp: lp, mgr: mgr, cmd: mgr.PlanUpgrade(lp.PkgName)})
+	plan, skipped := resolver.PlanUpgrade(lf.Packages)
+	for _, s := range skipped {
+		fprintf(os.Stderr, "genv upgrade: adapter %q not registered for %s — skipping\n", s.Manager, s.ID)
 	}
 
 	if len(plan) == 0 {
@@ -2091,7 +2147,7 @@ func upgradeCmd(args []string) int {
 
 	fPrintln(os.Stdout, "upgrade plan:")
 	for _, a := range plan {
-		fprintf(os.Stdout, "  %s  via %s  ==> %s\n", a.lp.ID, a.lp.Manager, strings.Join(a.cmd, " "))
+		fprintf(os.Stdout, "  %s  via %s  ==> %s\n", a.LP.ID, a.LP.Manager, strings.Join(a.Cmd, " "))
 	}
 
 	if *dryRun {
@@ -2103,29 +2159,24 @@ func upgradeCmd(args []string) int {
 		return exitOK
 	}
 
+	execResult := resolver.ExecuteUpgrade(context.Background(), plan, os.Stdin, os.Stdout, os.Stderr)
+
+	exitCode := exitOK
+	if len(execResult.Errors) > 0 {
+		for _, err := range execResult.Errors {
+			fprintf(os.Stderr, "genv upgrade: %v\n", err)
+		}
+		exitCode = exitLogic
+	}
+
 	// Build an ID→index map so each version update is O(1), not O(n).
 	lockIndex := make(map[string]int, len(lf.Packages))
 	for i, lp := range lf.Packages {
 		lockIndex[lp.ID] = i
 	}
-
-	exitCode := exitOK
-	for _, a := range plan {
-		fprintf(os.Stdout, "\n==> %s\n", strings.Join(a.cmd, " "))
-		cmd := exec.Command(a.cmd[0], a.cmd[1:]...)
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			fprintf(os.Stderr, "genv upgrade: %s: %v\n", a.lp.ID, err)
-			exitCode = exitLogic
-			continue
-		}
-		// Update InstalledVersion in lock for successfully upgraded packages.
-		if v, err := a.mgr.QueryVersion(a.lp.PkgName); err == nil && v != "" {
-			if idx, ok := lockIndex[a.lp.ID]; ok {
-				lf.Packages[idx].InstalledVersion = v
-			}
+	for _, upgraded := range execResult.Upgraded {
+		if idx, ok := lockIndex[upgraded.ID]; ok {
+			lf.Packages[idx].InstalledVersion = upgraded.InstalledVersion
 		}
 	}
 
