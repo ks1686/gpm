@@ -517,3 +517,43 @@ func TestLocateFields_NestedManagers(t *testing.T) {
 		t.Errorf("expected position for %q to be tracked; got keys: %v", key, pos)
 	}
 }
+
+func TestValidEnvName(t *testing.T) {
+	tests := []struct {
+		name     string
+		envName  string
+		expected bool
+	}{
+		// Valid cases
+		{"single letter uppercase", "A", true},
+		{"single letter lowercase", "z", true},
+		{"single underscore", "_", true},
+		{"uppercase word", "FOO", true},
+		{"lowercase word", "bar", true},
+		{"mixed case", "FooBar", true},
+		{"with digits", "FOO_123", true},
+		{"with trailing digit", "FOO1", true},
+		{"starts with underscore", "_FOO", true},
+		{"underscore and digits", "_123", true},
+
+		// Invalid cases
+		{"empty string", "", false},
+		{"starts with digit", "1FOO", false},
+		{"contains space", "FOO BAR", false},
+		{"contains hyphen", "FOO-BAR", false},
+		{"contains dot", "FOO.BAR", false},
+		{"contains punctuation", "FOO!", false},
+		{"unicode character", "FOO😀", false},
+		{"unicode letters", "FÖO", false},
+		{"starts with digit but valid otherwise", "1_", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := ValidEnvName(tc.envName)
+			if result != tc.expected {
+				t.Errorf("ValidEnvName(%q) = %v; want %v", tc.envName, result, tc.expected)
+			}
+		})
+	}
+}
