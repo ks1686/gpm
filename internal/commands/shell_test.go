@@ -7,6 +7,41 @@ import (
 	"github.com/ks1686/genv/internal/schema"
 )
 
+// ─── ensureShell ─────────────────────────────────────────────────────────────
+
+func TestEnsureShell_NilShell(t *testing.T) {
+	f := &schema.GenvFile{
+		SchemaVersion: schema.Version2,
+		Shell:         nil,
+	}
+	ensureShell(f)
+	if f.Shell == nil {
+		t.Fatal("expected Shell to be initialized, got nil")
+	}
+	if f.SchemaVersion != schema.Version3 {
+		t.Errorf("expected schemaVersion %q, got %q", schema.Version3, f.SchemaVersion)
+	}
+}
+
+func TestEnsureShell_ExistingShell(t *testing.T) {
+	existingShell := &schema.ShellConfig{
+		Aliases: map[string]schema.ShellAlias{
+			"ll": {Value: "ls -la"},
+		},
+	}
+	f := &schema.GenvFile{
+		SchemaVersion: schema.Version,
+		Shell:         existingShell,
+	}
+	ensureShell(f)
+	if f.Shell != existingShell {
+		t.Errorf("expected existing Shell %p to be preserved, got %p", existingShell, f.Shell)
+	}
+	if f.SchemaVersion != schema.Version3 {
+		t.Errorf("expected schemaVersion %q, got %q", schema.Version3, f.SchemaVersion)
+	}
+}
+
 // ─── ShellAliasSet ───────────────────────────────────────────────────────────
 
 func TestShellAliasSet_New(t *testing.T) {
