@@ -333,7 +333,7 @@ func TestFragmentPath(t *testing.T) {
 
 	t.Run("Error Condition", func(t *testing.T) {
 		t.Setenv("XDG_CONFIG_HOME", "")
-		t.Setenv("HOME", "") // Without HOME, os.UserHomeDir fails on unix
+		t.Setenv("HOME", "")        // Without HOME, os.UserHomeDir fails on unix
 		t.Setenv("USERPROFILE", "") // For Windows compatibility in test logic
 
 		path, err := FragmentPath()
