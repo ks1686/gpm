@@ -15,7 +15,7 @@ func isWSL() bool {
 	if err != nil {
 		return false
 	}
-	return strings.Contains(strings.ToLower(string(data)), "microsoft")
+	return containsFold(string(data), "microsoft")
 }
 
 // sanitizePathForWSL removes Windows-host path entries from a PATH string.
